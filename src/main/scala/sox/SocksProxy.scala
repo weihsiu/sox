@@ -3,6 +3,7 @@ package sox
 import java.io.*
 import java.net.*
 import ox.*
+import ox.channels.*
 import ox.either.*
 import scala.collection.mutable
 import scodec.*
@@ -11,6 +12,7 @@ import scodec.codecs.{either as _, *}
 import scodec.Attempt.Failure
 import scodec.Attempt.Successful
 import scala.io.StdIn
+import java.util.concurrent.atomic.AtomicReference
 
 trait SocksProxy:
   def start(port: Int)(using Ox): () => Unit
@@ -46,30 +48,69 @@ object SocksProxy:
   val replyCodec =
     (constant[Byte](0) :: replyCodeCodec :: uint16 :: bytes(4)).as[Reply]
 
-  def readBytes(inputStream: InputStream, len: Int): ByteVector =
-    val bs = Array.ofDim[Byte](len)
-    var b: Int = -1
-    var i = 0
+  case class Connection(
+      clientAddress: InetSocketAddress,
+      serverAddress: InetSocketAddress
+  )
+
+  case class Sources(
+      fromClient: Source[ByteVector],
+      fromServer: Source[ByteVector]
+  )
+
+  def forward(
+      socket: Socket,
+      inputStream: BufferedInputStream,
+      outputStream: BufferedOutputStream,
+      sink: Sink[ByteVector]
+  ): Unit =
+    val bs = Array.ofDim[Byte](2048)
+    var len = -1
     while
-      b = inputStream.read()
-      b != -1 && i < len
+      len = inputStream.read(bs)
+      len != -1
     do
-      bs(i) = b.toByte
-      i += 1
-    ByteVector.view(bs)
+      outputStream.write(bs, 0, len)
+      outputStream.flush()
+      sink.send(ByteVector(bs, 0, len))
+    socket.shutdownOutput()
+    sink.done()
 
-  def readTillNull(inputStream: InputStream, maxLen: Int): Option[ByteVector] =
-    val ab = mutable.ArrayBuffer[Byte]()
-    var b: Int = -1
-    while
-      if ab.length >= maxLen then None
-      b = inputStream.read()
-      b != -1 && b != 0
-    do ab += b.toByte
-    ab += 0
-    Some(ByteVector(ab))
+  def tunnel(
+      fromClientSocket: Socket,
+      toServerSocket: Socket,
+      connectionSources: AtomicReference[Map[Connection, Sources]]
+  )(using Ox): Unit =
+    val clientIn = BufferedInputStream(fromClientSocket.getInputStream())
+    val clientOut = BufferedOutputStream(fromClientSocket.getOutputStream())
+    val serverIn = BufferedInputStream(toServerSocket.getInputStream())
+    val serverOut = BufferedOutputStream(toServerSocket.getOutputStream())
+    val clientChannel = Channel.bufferedDefault[ByteVector]
+    val serverChannel = Channel.bufferedDefault[ByteVector]
+    val connection = Connection(
+      fromClientSocket.getRemoteSocketAddress().asInstanceOf[InetSocketAddress],
+      toServerSocket.getRemoteSocketAddress().asInstanceOf[InetSocketAddress]
+    )
+    val sources = Sources(clientChannel, serverChannel)
+    connectionSources.updateAndGet(_ + (connection -> sources))
+    fork:
+      val f1 = fork(forward(toServerSocket, clientIn, serverOut, clientChannel))
+      val f2 =
+        fork(forward(fromClientSocket, serverIn, clientOut, serverChannel))
+      f1.join()
+      f2.join()
+      connectionSources.updateAndGet(_ - connection)
+      fromClientSocket.close()
+      toServerSocket.close()
+      clientChannel.done()
+      serverChannel.done()
 
-  def handleRequest(inSocket: Socket)(using Ox): Unit =
+  def handleRequest(
+      inSocket: Socket,
+      connectionSources: AtomicReference[Map[Connection, Sources]],
+      inSink: Sink[ByteVector],
+      outSink: Sink[ByteVector]
+  )(using Ox): Unit =
     val inInput = BufferedInputStream(inSocket.getInputStream())
     val inOutput = BufferedOutputStream(inSocket.getOutputStream())
 
@@ -78,37 +119,11 @@ object SocksProxy:
       inOutput.write(replyCodec.encode(reply).getOrElse(???).toByteArray)
       inOutput.flush()
 
-    def tunnel(socket1: Socket, socket2: Socket)(using Ox): Unit =
-      def forward(
-          socket: Socket,
-          in: BufferedInputStream,
-          out: BufferedOutputStream
-      ): Unit =
-        val bs = Array.ofDim[Byte](2048)
-        var len = -1
-        while
-          len = in.read(bs)
-          len != -1
-        do
-          out.write(bs, 0, len)
-          out.flush()
-        socket.shutdownOutput()
-
-      val in1 = BufferedInputStream(socket1.getInputStream())
-      val out1 = BufferedOutputStream(socket1.getOutputStream())
-      val in2 = BufferedInputStream(socket2.getInputStream())
-      val out2 = BufferedOutputStream(socket2.getOutputStream())
-      fork:
-        val f1 = fork(forward(socket2, in1, out2))
-        val f2 = fork(forward(socket1, in2, out1))
-        f1.join()
-        f2.join()
-        socket1.close()
-        socket2.close()
-
-    val bv = readBytes(inInput, 8) ++ readTillNull(inInput, 100).getOrElse(
-      throw Exception("invalid request")
-    )
+    val bv = inInput.readBytes(8) ++ inInput
+      .readTillNull(100)
+      .getOrElse(
+        throw Exception("invalid request")
+      )
     requestCodec.decode(bv.toBitVector) match
       case Failure(e) =>
         throw Exception(s"failed to decode request $bv: ${e.message}")
@@ -118,7 +133,7 @@ object SocksProxy:
         println("connect request received")
         val outSocket =
           Socket(InetAddress.getByAddress(destIp.toArray), destPort)
-        tunnel(inSocket, outSocket)
+        tunnel(inSocket, outSocket, inSink, outSink)
         writeReply(ReplyCode.RequestGranted, destPort, destIp)
       case Request.BindRequest(destPort, destIp, userId) =>
         println("unsupported bind request")
@@ -133,7 +148,11 @@ object SocksProxy:
           val inSocket = serverSocket.accept()
           println("accepted")
           fork:
-            handleRequest(inSocket)
+            val inSink = Channel.unlimited[ByteVector]
+            val outSink = Channel.unlimited[ByteVector]
+            // fork(forever(println(s"from client: ${inSink.receive()}")))
+            // fork(forever(println(s"from server: ${outSink.receive()}")))
+            handleRequest(inSocket, inSink, outSink)
       () => serverSocket.close()
 
   @main
