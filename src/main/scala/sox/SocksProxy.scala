@@ -13,9 +13,10 @@ import scodec.Attempt.Failure
 import scodec.Attempt.Successful
 import scala.io.StdIn
 import java.util.concurrent.atomic.AtomicReference
+import scala.util.control.NonFatal
 
 trait SocksProxy:
-  def start(port: Int)(using Ox): () => Unit
+  def start(port: Int)(using IO, Ox): () => Unit
 
 object SocksProxy:
   enum ReplyCode(val value: Int):
@@ -59,67 +60,51 @@ object SocksProxy:
   )
 
   def forward(
-      socket: Socket,
-      inputStream: BufferedInputStream,
-      outputStream: BufferedOutputStream,
-      sink: Sink[ByteVector]
-  ): Unit =
-    val bs = Array.ofDim[Byte](2048)
-    var len = -1
-    while
-      len = inputStream.read(bs)
-      len != -1
-    do
-      outputStream.write(bs, 0, len)
-      outputStream.flush()
-      sink.send(ByteVector(bs, 0, len))
-    socket.shutdownOutput()
-    sink.done()
+      inputStream: InputStream,
+      outputStream: OutputStream,
+      sink: Sink[ByteVector],
+      source: Source[ByteVector]
+  )(using IO, Ox): Unit =
+    par(
+      sink.fromInputStreamBV(BufferedInputStream(inputStream)),
+      source.toOutputStreamBV(BufferedOutputStream(outputStream))
+    )
 
   def tunnel(
-      fromClientSocket: Socket,
-      toServerSocket: Socket,
-      connectionSources: AtomicReference[Map[Connection, Sources]]
-  )(using Ox): Unit =
-    val clientIn = BufferedInputStream(fromClientSocket.getInputStream())
-    val clientOut = BufferedOutputStream(fromClientSocket.getOutputStream())
-    val serverIn = BufferedInputStream(toServerSocket.getInputStream())
-    val serverOut = BufferedOutputStream(toServerSocket.getOutputStream())
-    val clientChannel = Channel.bufferedDefault[ByteVector]
-    val serverChannel = Channel.bufferedDefault[ByteVector]
-    val connection = Connection(
-      fromClientSocket.getRemoteSocketAddress().asInstanceOf[InetSocketAddress],
-      toServerSocket.getRemoteSocketAddress().asInstanceOf[InetSocketAddress]
+      clientSocket: Socket,
+      serverSocket: Socket,
+      clientChannel: Channel[ByteVector],
+      serverChannel: Channel[ByteVector]
+  )(using IO, Ox): Unit =
+    par(
+      forward(
+        clientSocket.getInputStream(),
+        serverSocket.getOutputStream(),
+        clientChannel,
+        clientChannel
+      ),
+      forward(
+        serverSocket.getInputStream(),
+        clientSocket.getOutputStream(),
+        serverChannel,
+        serverChannel
+      )
     )
-    val sources = Sources(clientChannel, serverChannel)
-    connectionSources.updateAndGet(_ + (connection -> sources))
-    fork:
-      val f1 = fork(forward(toServerSocket, clientIn, serverOut, clientChannel))
-      val f2 =
-        fork(forward(fromClientSocket, serverIn, clientOut, serverChannel))
-      f1.join()
-      f2.join()
-      connectionSources.updateAndGet(_ - connection)
-      fromClientSocket.close()
-      toServerSocket.close()
-      clientChannel.done()
-      serverChannel.done()
 
   def handleRequest(
-      inSocket: Socket,
-      connectionSources: AtomicReference[Map[Connection, Sources]],
-      inSink: Sink[ByteVector],
-      outSink: Sink[ByteVector]
-  )(using Ox): Unit =
-    val inInput = BufferedInputStream(inSocket.getInputStream())
-    val inOutput = BufferedOutputStream(inSocket.getOutputStream())
+      clientSocket: Socket,
+      clientChannel: Channel[ByteVector],
+      serverChannel: Channel[ByteVector]
+  )(using IO, Ox): Unit =
+    val clientBIS = BufferedInputStream(clientSocket.getInputStream())
+    val clientBOS = BufferedOutputStream(clientSocket.getOutputStream())
 
     def writeReply(code: ReplyCode, destPort: Int, destIp: ByteVector): Unit =
       val reply = Reply(code, destPort, destIp)
-      inOutput.write(replyCodec.encode(reply).getOrElse(???).toByteArray)
-      inOutput.flush()
+      clientBOS.write(replyCodec.encode(reply).getOrElse(???).toByteArray)
+      clientBOS.flush()
 
-    val bv = inInput.readBytes(8) ++ inInput
+    val bv = clientBIS.readBytes(8) ++ clientBIS
       .readTillNull(100)
       .getOrElse(
         throw Exception("invalid request")
@@ -130,33 +115,37 @@ object SocksProxy:
       case Successful(r) => r.value
     match
       case Request.ConnectRequest(destPort, destIp, userId) =>
-        println("connect request received")
-        val outSocket =
+        val serverSocket =
           Socket(InetAddress.getByAddress(destIp.toArray), destPort)
-        tunnel(inSocket, outSocket, inSink, outSink)
         writeReply(ReplyCode.RequestGranted, destPort, destIp)
+        tunnel(clientSocket, serverSocket, clientChannel, serverChannel)
+        serverSocket.close()
       case Request.BindRequest(destPort, destIp, userId) =>
         println("unsupported bind request")
         writeReply(ReplyCode.RequestRejected91, destPort, destIp)
 
   def apply(): SocksProxy = new SocksProxy:
-    def start(port: Int)(using Ox): () => Unit =
+    def start(port: Int)(using IO, Ox): () => Unit =
       val serverSocket = ServerSocket(port)
       fork:
         forever:
-          println("accepting")
-          val inSocket = serverSocket.accept()
-          println("accepted")
-          fork:
-            val inSink = Channel.unlimited[ByteVector]
-            val outSink = Channel.unlimited[ByteVector]
-            // fork(forever(println(s"from client: ${inSink.receive()}")))
-            // fork(forever(println(s"from server: ${outSink.receive()}")))
-            handleRequest(inSocket, inSink, outSink)
+          try
+            val clientSocket = serverSocket.accept()
+            fork:
+              val clientChannel = Channel.rendezvous[ByteVector]
+              val serverChannel = Channel.rendezvous[ByteVector]
+              handleRequest(clientSocket, clientChannel, serverChannel)
+              clientSocket.close()
+          catch
+            case NonFatal(e) =>
+              println(e)
+              throw e
       () => serverSocket.close()
 
   @main
   def runSocksProxy() =
     supervised:
-      val stop = SocksProxy().start(1080)
-      StdIn.readLine()
+      IO.unsafe:
+        val stop = SocksProxy().start(1080)
+        StdIn.readLine()
+        stop()

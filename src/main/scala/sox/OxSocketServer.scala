@@ -61,11 +61,13 @@ object OxSocketServer:
               val request = BufferedReader(
                 InputStreamReader(socket.getInputStream())
               ).readLine()
+              println(s"request is $request")
               val writer =
                 BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
-              writer.write(request)
+              writer.write(request.toUpperCase())
               writer.flush()
             .join()
+            println("socket closed")
       .join()
 
   @main

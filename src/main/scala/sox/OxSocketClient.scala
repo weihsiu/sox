@@ -14,7 +14,9 @@ object OxSocketClient:
       writer.flush()
       val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
       val response = reader.readLine()
-      assert(response == "hello")
+      println(s"response = $response")
+      assert(response == "HELLO")
+      socket.close()
 
   @main
   def runOxSocketClient() =
@@ -29,4 +31,5 @@ object OxSocketClient:
         // fork:
         //   connect("localhost", 8080)
         .join()
+      println(s"result length = ${result.length}")
       assert(result.length == n)
