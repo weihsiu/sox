@@ -15,7 +15,7 @@ object OxSocketClient:
       val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
       val response = reader.readLine()
       println(s"response = $response")
-      assert(response == "HELLO")
+      // assert(response == "HELLO")
       socket.close()
 
   @main

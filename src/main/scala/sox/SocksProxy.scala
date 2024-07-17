@@ -15,8 +15,18 @@ import scala.io.StdIn
 import java.util.concurrent.atomic.AtomicReference
 import scala.util.control.NonFatal
 
+case class ProxyConfig(
+    clientSink: Sink[ByteVector], // receives input from client
+    serverSource: Source[ByteVector], // sends output to server
+    serverSink: Sink[ByteVector], // receives input from server
+    clientSource: Source[ByteVector] // sends output to client
+)
+
 trait SocksProxy:
-  def start(port: Int)(using IO, Ox): () => Unit
+  def start(
+      port: Int,
+      proxyConfig: () => ProxyConfig
+  )(using IO, Ox): () => Unit
 
 object SocksProxy:
   enum ReplyCode(val value: Int):
@@ -73,29 +83,27 @@ object SocksProxy:
   def tunnel(
       clientSocket: Socket,
       serverSocket: Socket,
-      clientChannel: Channel[ByteVector],
-      serverChannel: Channel[ByteVector]
+      proxyConfig: ProxyConfig
   )(using IO, Ox): Unit =
     par(
       forward(
         clientSocket.getInputStream(),
         serverSocket.getOutputStream(),
-        clientChannel,
-        clientChannel
+        proxyConfig.clientSink,
+        proxyConfig.serverSource
       ),
       forward(
         serverSocket.getInputStream(),
         clientSocket.getOutputStream(),
-        serverChannel,
-        serverChannel
+        proxyConfig.serverSink,
+        proxyConfig.clientSource
       )
     )
 
-  def handleRequest(
-      clientSocket: Socket,
-      clientChannel: Channel[ByteVector],
-      serverChannel: Channel[ByteVector]
-  )(using IO, Ox): Unit =
+  def handleRequest(clientSocket: Socket, proxyConfig: ProxyConfig)(using
+      IO,
+      Ox
+  ): Unit =
     val clientBIS = BufferedInputStream(clientSocket.getInputStream())
     val clientBOS = BufferedOutputStream(clientSocket.getOutputStream())
 
@@ -118,23 +126,24 @@ object SocksProxy:
         val serverSocket =
           Socket(InetAddress.getByAddress(destIp.toArray), destPort)
         writeReply(ReplyCode.RequestGranted, destPort, destIp)
-        tunnel(clientSocket, serverSocket, clientChannel, serverChannel)
+        tunnel(clientSocket, serverSocket, proxyConfig)
         serverSocket.close()
       case Request.BindRequest(destPort, destIp, userId) =>
         println("unsupported bind request")
         writeReply(ReplyCode.RequestRejected91, destPort, destIp)
 
   def apply(): SocksProxy = new SocksProxy:
-    def start(port: Int)(using IO, Ox): () => Unit =
+    def start(
+        port: Int,
+        proxyConfig: () => ProxyConfig
+    )(using IO, Ox): () => Unit =
       val serverSocket = ServerSocket(port)
       fork:
         forever:
           try
             val clientSocket = serverSocket.accept()
             fork:
-              val clientChannel = Channel.rendezvous[ByteVector]
-              val serverChannel = Channel.rendezvous[ByteVector]
-              handleRequest(clientSocket, clientChannel, serverChannel)
+              handleRequest(clientSocket, proxyConfig())
               clientSocket.close()
           catch
             case NonFatal(e) =>
@@ -142,10 +151,45 @@ object SocksProxy:
               throw e
       () => serverSocket.close()
 
+  def forwardingConfig(): ProxyConfig =
+    val ch1 = Channel.rendezvous[ByteVector]
+    val ch2 = Channel.rendezvous[ByteVector]
+    ProxyConfig(ch1, ch1, ch2, ch2)
+
+  def transformingConfig[A, B](
+      clientZero: A,
+      clientTransform: (A, ByteVector) => (A, ByteVector),
+      serverZero: B,
+      serverTransform: (B, ByteVector) => (B, ByteVector)
+  )(using Ox)(): ProxyConfig =
+    val ch1 = Channel.rendezvous[ByteVector]
+    val serverSource = ch1.mapStateful(() => clientZero)(clientTransform)
+    val ch2 = Channel.rendezvous[ByteVector]
+    val clientSource = ch2.mapStateful(() => serverZero)(serverTransform)
+    ProxyConfig(ch1, serverSource, ch2, clientSource)
+
   @main
   def runSocksProxy() =
     supervised:
       IO.unsafe:
-        val stop = SocksProxy().start(1080)
+        // val stop = SocksProxy().start(1080, forwardingConfig)
+        val stop = SocksProxy().start(
+          1080,
+          transformingConfig(
+            (),
+            (_, bv) =>
+              println(
+                s"sending ${utf8.decodeValue(bv.toBitVector).getOrElse(???)}"
+              )
+              ((), bv)
+            ,
+            (),
+            (_, bv) =>
+              println(
+                s"receiving ${utf8.decodeValue(bv.toBitVector).getOrElse(???)}"
+              )
+              ((), utf8.encode("goodbye").getOrElse(???).toByteVector)
+          )
+        )
         StdIn.readLine()
         stop()
