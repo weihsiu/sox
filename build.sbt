@@ -10,7 +10,9 @@ libraryDependencies ++= Seq(
   "org.scodec" %% "scodec-core" % "2.3.0",
   "com.softwaremill.ox" %% "core" % "0.3.0",
   "com.softwaremill.sttp.client4" %% "core" % "4.0.0-M16",
-  "com.softwaremill.sttp.tapir" %% "tapir-netty-server-sync" % "1.10.13",
+  "com.softwaremill.sttp.tapir" %% "tapir-netty-server-sync" % "1.11.0",
+  "com.softwaremill.sttp.tapir" %% "tapir-json-circe" % "1.11.0",
+  "com.typesafe.scala-logging" %% "scala-logging" % "3.9.5",
   "ch.qos.logback" % "logback-classic" % "1.5.6",
   "org.scalameta" %% "munit" % "1.0.0" % Test,
   "eu.monniot" %% "scala3mock" % "0.6.3" % Test

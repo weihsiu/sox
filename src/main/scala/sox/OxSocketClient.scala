@@ -4,11 +4,13 @@ import java.io.*
 import java.net.*
 import ox.*
 import scala.util.Try
+import scala.concurrent.duration.*
 
 object OxSocketClient:
   def connect(host: String, port: Int): Unit =
     supervised:
       val socket = useCloseableInScope(Socket(host, port))
+      sleep(500.millis)
       val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
       writer.write("hello\n")
       writer.flush()

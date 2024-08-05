@@ -14,21 +14,27 @@ import scodec.Attempt.Successful
 import scala.io.StdIn
 import java.util.concurrent.atomic.AtomicReference
 import scala.util.control.NonFatal
+import sox.TopicConfig.TopicsAR
+import sox.EventConfig.ProxyEvent
+import sox.plugins.*
+import scala.util.Try
+import com.typesafe.scalalogging.Logger
+
+case class FromToAddresses(fromAddress: InetSocketAddress, toAddress: InetSocketAddress)
 
 case class ProxyConfig(
-    clientSink: Sink[ByteVector], // receives input from client
-    serverSource: Source[ByteVector], // sends output to server
-    serverSink: Sink[ByteVector], // receives input from server
-    clientSource: Source[ByteVector] // sends output to client
+    upstreamSink: Sink[ByteVector], // receives input from client
+    upstreamSource: Source[ByteVector], // sends output to server
+    downstreamSink: Sink[ByteVector], // receives input from server
+    downstreamSource: Source[ByteVector] // sends output to client
 )
 
 trait SocksProxy:
-  def start(
-      port: Int,
-      proxyConfig: () => ProxyConfig
-  )(using IO, Ox): () => Unit
+  def start(port: Int, proxyConfig: FromToAddresses => ProxyConfig)(using IO, Ox): () => Unit
 
 object SocksProxy:
+  val logger = Logger[SocksProxy.type]
+
   enum ReplyCode(val value: Int):
     case RequestGranted extends ReplyCode(90)
     case RequestRejected91 extends ReplyCode(91)
@@ -47,8 +53,8 @@ object SocksProxy:
 
   val requestCodec = discriminated[Request]
     .by(uint16)
-    .subcaseP[Request.ConnectRequest](0x0401) {
-      case x: Request.ConnectRequest => x
+    .subcaseP[Request.ConnectRequest](0x0401) { case x: Request.ConnectRequest =>
+      x
     }(
       bodyCodec.as[Request.ConnectRequest]
     )
@@ -59,51 +65,37 @@ object SocksProxy:
   val replyCodec =
     (constant[Byte](0) :: replyCodeCodec :: uint16 :: bytes(4)).as[Reply]
 
-  case class Connection(
-      clientAddress: InetSocketAddress,
-      serverAddress: InetSocketAddress
-  )
+  case class Connection(clientAddress: InetSocketAddress, serverAddress: InetSocketAddress)
 
-  case class Sources(
-      fromClient: Source[ByteVector],
-      fromServer: Source[ByteVector]
-  )
+  case class Sources(fromClient: Source[ByteVector], fromServer: Source[ByteVector])
 
-  def forward(
-      inputStream: InputStream,
-      outputStream: OutputStream,
-      sink: Sink[ByteVector],
-      source: Source[ByteVector]
-  )(using IO, Ox): Unit =
+  def forward(inputStream: InputStream, outputStream: OutputStream, sink: Sink[ByteVector], source: Source[ByteVector])(
+      using
+      IO,
+      Ox
+  ): Unit =
     par(
       sink.fromInputStreamBV(BufferedInputStream(inputStream)),
       source.toOutputStreamBV(BufferedOutputStream(outputStream))
     )
 
-  def tunnel(
-      clientSocket: Socket,
-      serverSocket: Socket,
-      proxyConfig: ProxyConfig
-  )(using IO, Ox): Unit =
+  def tunnel(clientSocket: Socket, serverSocket: Socket, proxyConfig: ProxyConfig)(using IO, Ox): Unit =
     par(
       forward(
         clientSocket.getInputStream(),
         serverSocket.getOutputStream(),
-        proxyConfig.clientSink,
-        proxyConfig.serverSource
+        proxyConfig.upstreamSink,
+        proxyConfig.upstreamSource
       ),
       forward(
         serverSocket.getInputStream(),
         clientSocket.getOutputStream(),
-        proxyConfig.serverSink,
-        proxyConfig.clientSource
+        proxyConfig.downstreamSink,
+        proxyConfig.downstreamSource
       )
     )
 
-  def handleRequest(clientSocket: Socket, proxyConfig: ProxyConfig)(using
-      IO,
-      Ox
-  ): Unit =
+  def handleRequest(clientSocket: Socket, generateProxyConfig: FromToAddresses => ProxyConfig)(using IO, Ox): Unit =
     val clientBIS = BufferedInputStream(clientSocket.getInputStream())
     val clientBOS = BufferedOutputStream(clientSocket.getOutputStream())
 
@@ -126,70 +118,116 @@ object SocksProxy:
         val serverSocket =
           Socket(InetAddress.getByAddress(destIp.toArray), destPort)
         writeReply(ReplyCode.RequestGranted, destPort, destIp)
-        tunnel(clientSocket, serverSocket, proxyConfig)
+        tunnel(
+          clientSocket,
+          serverSocket,
+          generateProxyConfig(
+            FromToAddresses(
+              clientSocket
+                .getRemoteSocketAddress()
+                .asInstanceOf[InetSocketAddress],
+              serverSocket
+                .getRemoteSocketAddress()
+                .asInstanceOf[InetSocketAddress]
+            )
+          )
+        )
         serverSocket.close()
       case Request.BindRequest(destPort, destIp, userId) =>
         println("unsupported bind request")
         writeReply(ReplyCode.RequestRejected91, destPort, destIp)
 
   def apply(): SocksProxy = new SocksProxy:
-    def start(
-        port: Int,
-        proxyConfig: () => ProxyConfig
-    )(using IO, Ox): () => Unit =
+    def start(port: Int, generateProxyConfig: FromToAddresses => ProxyConfig)(using IO, Ox): () => Unit =
       val serverSocket = ServerSocket(port)
       fork:
-        forever:
-          try
-            val clientSocket = serverSocket.accept()
-            fork:
-              handleRequest(clientSocket, proxyConfig())
-              clientSocket.close()
-          catch
-            case NonFatal(e) =>
-              println(e)
-              throw e
+        repeatWhile:
+          Try(serverSocket.accept()).fold(
+            _ match
+              case _: SocketException if serverSocket.isClosed() => false
+              case e                                             => throw e
+            ,
+            clientSocket =>
+              fork:
+                handleRequest(clientSocket, generateProxyConfig)
+                clientSocket.close()
+              true
+          )
       () => serverSocket.close()
 
-  def forwardingConfig(): ProxyConfig =
+  def forwardingConfig(addresses: FromToAddresses): ProxyConfig =
     val ch1 = Channel.rendezvous[ByteVector]
     val ch2 = Channel.rendezvous[ByteVector]
     ProxyConfig(ch1, ch1, ch2, ch2)
 
   def transformingConfig[A, B](
-      clientZero: A,
-      clientTransform: (A, ByteVector) => (A, ByteVector),
-      serverZero: B,
-      serverTransform: (B, ByteVector) => (B, ByteVector)
-  )(using Ox)(): ProxyConfig =
+      upstreamInitial: () => A,
+      upstreamTransform: (A, ByteVector) => (A, ByteVector),
+      upstreamComplete: A => Option[ByteVector],
+      downstreamInitial: () => B,
+      downstreamTransform: (B, ByteVector) => (B, ByteVector),
+      downstreamComplete: B => Option[ByteVector]
+  )(using Ox)(addresses: FromToAddresses): ProxyConfig =
     val ch1 = Channel.rendezvous[ByteVector]
-    val serverSource = ch1.mapStateful(() => clientZero)(clientTransform)
+    val upstreamSource = ch1.mapStateful(upstreamInitial)(upstreamTransform, upstreamComplete)
     val ch2 = Channel.rendezvous[ByteVector]
-    val clientSource = ch2.mapStateful(() => serverZero)(serverTransform)
-    ProxyConfig(ch1, serverSource, ch2, clientSource)
+    val downstreamSource = ch2.mapStateful(downstreamInitial)(downstreamTransform, downstreamComplete)
+    ProxyConfig(ch1, upstreamSource, ch2, downstreamSource)
+
+  def loggingConfig(using Ox)(addresses: FromToAddresses): ProxyConfig =
+    transformingConfig(
+      () => (),
+      (_, bv) =>
+        logger.info(s"${addresses.fromAddress} -> $bv")
+        ((), bv)
+      ,
+      _ =>
+        logger.info("upstream completes")
+        None
+      ,
+      () => (),
+      (_, bv) =>
+        logger.info(s"${addresses.toAddress} <- $bv")
+        ((), bv)
+      ,
+      _ =>
+        logger.info("downstream completes")
+        None
+    )(addresses)
+
+  case class Topics(upstreamTopic: Topic[ByteVector], downstreamTopic: Topic[ByteVector])
 
   @main
   def runSocksProxy() =
     supervised:
       IO.unsafe:
         // val stop = SocksProxy().start(1080, forwardingConfig)
-        val stop = SocksProxy().start(
-          1080,
-          transformingConfig(
-            (),
-            (_, bv) =>
-              println(
-                s"sending ${utf8.decodeValue(bv.toBitVector).getOrElse(???)}"
-              )
-              ((), bv)
-            ,
-            (),
-            (_, bv) =>
-              println(
-                s"receiving ${utf8.decodeValue(bv.toBitVector).getOrElse(???)}"
-              )
-              ((), utf8.encode("goodbye").getOrElse(???).toByteVector)
-          )
-        )
+
+        // val stop = SocksProxy().start(1080, loggingConfig)
+
+        // val topicsAR: TopicsAR = AtomicReference()
+        // val eventChannel = Channel.bufferedDefault[TopicConfig.ProxyEvent]
+        // fork(forever(eventChannel.receive().pipe(println)))
+        // val stop = SocksProxy().start(1080, TopicConfig(topicsAR, eventChannel))
+
+        // val eventChannel = Channel.bufferedDefault[EventConfig.ProxyEvent]
+        // fork(forever(eventChannel.receive() match
+        //   case ProxyEvent.UpstreamConnectEvent(addresses, upstreamSource) =>
+        //     println(s"upstream connect $addresses")
+        //     fork(upstreamSource().drain())
+        //   case ProxyEvent.DownstreamConnectEvent(addresses, downstreamSource) =>
+        //     println(s"downstream connect $addresses")
+        //     fork(downstreamSource().drain())
+        //   case _ => ()
+        // ))
+        // val stop = SocksProxy().start(1080, EventConfig(eventChannel))
+
+        val pluginConfig = PluginConfig()
+        val stopLoggingPlugin = pluginConfig.startPlugin(ProxyPlugin.loggingPlugin)
+        val stopWSServerPlugin = pluginConfig.startPlugin(MonitorPlugin(9090))
+        val stopSocksProxy = SocksProxy().start(1080, pluginConfig.proxyConfig)
+
         StdIn.readLine()
-        stop()
+        stopWSServerPlugin()
+        stopLoggingPlugin()
+        stopSocksProxy()

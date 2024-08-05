@@ -53,7 +53,7 @@ abstract class Conduit[A](
 
 class Topic[A](using Ox)
     extends Conduit[A]((senders, receivers) =>
-      if senders.isEmpty then sleep(10.seconds)
+      if senders.isEmpty then never // sleep(10.seconds)
       else
         val value = select(senders.map(_.receiveClause).toList)
         receivers.foreach(recv => fork(recv.send(value.value)))
@@ -63,7 +63,7 @@ class Queue[A](using Ox)
     extends Conduit[A]({
       var index = -1
       (senders, receivers) =>
-        if senders.isEmpty then sleep(10.seconds)
+        if senders.isEmpty then never // sleep(10.seconds)
         else
           val value = select(senders.map(_.receiveClause).toList)
           if receivers.nonEmpty then
